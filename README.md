@@ -4,11 +4,14 @@ A Windows-style Task Manager for macOS, written in SwiftUI.
 
 ## Features
 
-**Processes**
-- Every running process with CPU, memory and disk usage, refreshed every 1.5 seconds.
-- Filter by Apps, My Processes or All Processes, and search by name or PID.
-- Sort by any column.
-- End Task (asks the process to quit) and Force Quit (kills it immediately), from the buttons or the right-click menu.
+**Processes** (grouped like Windows)
+- **Apps**: every app with a Dock icon, with all of its helper processes grouped under it and their CPU, memory and disk added up. Expand an app to see its processes.
+- **Background processes**: your other processes (menu bar apps, agents, command-line tools).
+- **macOS processes**: system processes owned by root or other users.
+- End Task / Force Quit on an app ends the whole app; on a single row, just that process.
+
+**Details**
+- Flat list of every process with PID and user, filterable and sortable.
 
 **Performance**
 - 60-second live graphs for CPU, memory and network.
@@ -52,7 +55,8 @@ No Apple Developer account is needed to run it on your own Mac (it is signed to 
 
 ## Known limitations
 
-- **No usage stats for other users' processes.** macOS only lets a normal app read CPU and memory for processes you own. Root and system processes show `—`. Activity Monitor gets around this with Apple-only privileges; this app would need an admin helper tool.
+- **System processes have less detail.** macOS only lets a normal app read your own processes directly. For root/system processes, CPU and memory come from the built-in `ps` tool (memory is resident size, CPU is a short average) and disk activity isn't available.
+- **App grouping uses a private macOS function** (`responsibility_get_pid_responsible_for_pid`) to find which app a helper belongs to, e.g. Safari's web content processes. If it ever disappears, grouping falls back to parent processes.
 - **System daemons are read-only.** Changing them needs administrator rights.
 - **Login items added through System Settings aren't listed.** macOS doesn't expose that list to other apps.
 - **CPU % is a share of the whole machine** (Windows-style, max 100%), not per core like Activity Monitor.

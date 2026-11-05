@@ -4,20 +4,20 @@ import Observation
 
 struct ProcessRow: Identifiable {
     let pid: pid_t
+    let parentPID: pid_t
     let name: String
     let user: String
     let path: String?
-    let isApp: Bool
     let isMine: Bool
     let icon: NSImage?
-    /// False when macOS doesn't let us read CPU/memory (processes owned by other users).
-    let hasStats: Bool
-    /// Percent of the whole machine's CPU capacity (Windows-style, max 100%).
-    let cpu: Double
-    /// Physical memory footprint in bytes (the number Activity Monitor shows).
-    let memory: UInt64
-    /// Disk read + write, bytes per second.
-    let diskRate: Double
+    /// PID of the app (with a Dock icon) this process belongs to; the app's own PID for its main process.
+    let ownerAppPID: pid_t?
+    /// Percent of the whole machine's CPU capacity (Windows-style, max 100%). Nil = unknown.
+    let cpu: Double?
+    /// Bytes: memory footprint for your processes, resident size for system ones. Nil = unknown.
+    let memory: UInt64?
+    /// Disk read + write, bytes per second. Nil = unknown (system processes).
+    let diskRate: Double?
     /// Mach start time, when readable. Used to make sure a PID wasn't reused.
     let startTime: UInt64?
 
@@ -25,6 +25,12 @@ struct ProcessRow: Identifiable {
 
     /// PID 0 is kernel_task, and kill(0, …) would signal our own process group.
     var canEnd: Bool { pid > 0 }
+    var isAppMain: Bool { ownerAppPID == pid }
+
+    // Non-optional keys so columns can sort; unknown values sort last.
+    var cpuSort: Double { cpu ?? -1 }
+    var memorySort: UInt64 { memory ?? 0 }
+    var diskSort: Double { diskRate ?? -1 }
 }
 
 @MainActor
@@ -85,8 +91,30 @@ final class ProcessStore {
         let elapsedNanos = (previousTime == 0 || now <= previousTime) ? 0 : Double(now - previousTime)
 
         var apps: [pid_t: NSRunningApplication] = [:]
+        var regularAppPIDs = Set<pid_t>()
         for app in NSWorkspace.shared.runningApplications {
             apps[app.processIdentifier] = app
+            if app.activationPolicy == .regular {
+                regularAppPIDs.insert(app.processIdentifier)
+            }
+        }
+        let parents = Dictionary(raw.map { ($0.pid, $0.parentPID) }, uniquingKeysWith: { first, _ in first })
+
+        /// Which Dock app a process belongs to: itself, the process macOS holds
+        /// responsible for it, or the nearest app among its parents.
+        func owner(of process: ProcessSampler.RawProcess) -> pid_t? {
+            if regularAppPIDs.contains(process.pid) { return process.pid }
+            if let responsible = process.responsiblePID, regularAppPIDs.contains(responsible) {
+                return responsible
+            }
+            var ancestor = process.parentPID
+            var steps = 0
+            while ancestor > 1, steps < 32 {
+                if regularAppPIDs.contains(ancestor) { return ancestor }
+                ancestor = parents[ancestor] ?? 0
+                steps += 1
+            }
+            return nil
         }
 
         var counters: [pid_t: Counters] = [:]
@@ -99,33 +127,41 @@ final class ProcessStore {
                 ?? process.path.map { ($0 as NSString).lastPathComponent }
                 ?? process.command
 
-            var cpu = 0.0
-            var diskRate = 0.0
+            var cpu: Double?
+            var memory: UInt64?
+            var diskRate: Double?
+
             if let usage = process.usage {
                 counters[process.pid] = Counters(
                     cpuNanos: usage.cpuNanos,
                     diskBytes: usage.diskBytes,
                     startTime: usage.startTime
                 )
+                memory = usage.memory
+                cpu = 0
+                diskRate = 0
                 // Only compare against the same process, not a new one that reused the PID.
                 if elapsedNanos > 0, let prev = previous[process.pid], prev.startTime == usage.startTime {
                     cpu = max(0, usage.cpuNanos - prev.cpuNanos) / elapsedNanos / cpuCount * 100
                     let diskDelta = usage.diskBytes >= prev.diskBytes ? usage.diskBytes - prev.diskBytes : 0
                     diskRate = Double(diskDelta) / (elapsedNanos / 1_000_000_000)
                 }
+            } else if let fallback = process.fallback {
+                cpu = fallback.cpuPercentOfOneCore / cpuCount
+                memory = fallback.residentBytes
             }
 
             rows.append(ProcessRow(
                 pid: process.pid,
+                parentPID: process.parentPID,
                 name: name.isEmpty ? "PID \(process.pid)" : name,
                 user: userName(process.uid),
                 path: process.path,
-                isApp: app?.activationPolicy == .regular,
                 isMine: process.uid == myUID,
                 icon: app?.icon,
-                hasStats: process.usage != nil,
-                cpu: min(cpu, 100),
-                memory: process.usage?.memory ?? 0,
+                ownerAppPID: process.uid == myUID ? owner(of: process) : nil,
+                cpu: cpu.map { min($0, 100) },
+                memory: memory,
                 diskRate: diskRate,
                 startTime: process.usage?.startTime
             ))

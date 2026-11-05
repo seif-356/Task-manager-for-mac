@@ -1,36 +1,70 @@
 import AppKit
 import SwiftUI
 
+/// One row in the grouped Processes tab: a section header, an app (with its
+/// processes as children), or a single process.
+struct ProcessNode: Identifiable {
+    enum Kind {
+        case section
+        case app
+        case process
+    }
+
+    let id: String
+    let kind: Kind
+    let name: String
+    let icon: NSImage?
+    /// What End Task acts on: the app's main process, or the process itself.
+    let target: ProcessRow?
+    let cpu: Double?
+    let memory: UInt64?
+    let diskRate: Double?
+    let children: [ProcessNode]
+
+    var cpuSort: Double { cpu ?? -1 }
+    var memorySort: UInt64 { memory ?? 0 }
+    var diskSort: Double { diskRate ?? -1 }
+}
+
+/// Windows-style Processes tab: Apps (expandable, usage summed over all of an
+/// app's processes), Background processes, and macOS processes.
 struct ProcessesView: View {
     let store: ProcessStore
+    let monitor: SystemMonitor
 
-    enum Scope: String, CaseIterable, Identifiable {
-        case apps = "Apps"
-        case mine = "My Processes"
-        case all = "All Processes"
-        var id: Self { self }
+    private struct Tree {
+        var apps: [ProcessNode] = []
+        var background: [ProcessNode] = []
+        var system: [ProcessNode] = []
+        var index: [String: ProcessNode] = [:]
+        var processCount = 0
     }
 
     private struct PendingEnd {
-        let row: ProcessRow
+        let target: ProcessRow
+        let name: String
         let mode: ProcessStore.EndMode
+        let processCount: Int
     }
 
-    @State private var scope: Scope = .mine
     @State private var search = ""
-    @State private var selection: ProcessRow.ID?
-    @State private var sortOrder = [KeyPathComparator(\ProcessRow.cpu, order: .reverse)]
+    @State private var selection: ProcessNode.ID?
+    @State private var sortOrder = [KeyPathComparator(\ProcessNode.cpuSort, order: .reverse)]
+    @State private var showApps = true
+    @State private var showBackground = true
+    @State private var showSystem = false
+    @State private var expandedApps: Set<String> = []
     @State private var pendingEnd: PendingEnd?
     @State private var errorMessage: String?
 
     var body: some View {
-        let rows = visibleRows
+        let tree = buildTree()
         VStack(spacing: 0) {
-            header
+            header(tree)
             Divider()
-            table(rows)
+            table(tree)
             Divider()
-            footer(count: rows.count)
+            footer(tree)
         }
         .confirmationDialog(
             dialogTitle,
@@ -38,14 +72,12 @@ struct ProcessesView: View {
             presenting: pendingEnd
         ) { pending in
             Button(pending.mode == .force ? "Force Quit" : "End Task", role: .destructive) {
-                errorMessage = store.end(pending.row, mode: pending.mode)
+                errorMessage = store.end(pending.target, mode: pending.mode)
                 Task { await store.refresh() }
             }
             Button("Cancel", role: .cancel) {}
         } message: { pending in
-            Text(pending.mode == .force
-                 ? "The process is killed immediately. Unsaved work will be lost."
-                 : "The process will be asked to quit.")
+            Text(dialogMessage(pending))
         }
         .alert(
             "Couldn't End Task",
@@ -57,77 +89,79 @@ struct ProcessesView: View {
         }
     }
 
-    private var header: some View {
-        HStack {
-            Picker("Show", selection: $scope) {
-                ForEach(Scope.allCases) { scope in
-                    Text(scope.rawValue).tag(scope)
-                }
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .fixedSize()
+    // MARK: Layout
 
+    private func header(_ tree: Tree) -> some View {
+        HStack(spacing: 16) {
+            Label("CPU \(Format.percent(monitor.cpuUsage))", systemImage: "cpu")
+            Label("Memory \(Format.percent(monitor.memoryPercent))", systemImage: "memorychip")
+            Label("\(tree.processCount) processes", systemImage: "square.stack.3d.up")
             Spacer()
-
             TextField("Search name or PID", text: $search)
                 .textFieldStyle(.roundedBorder)
                 .frame(maxWidth: 240)
         }
+        .font(.callout)
+        .monospacedDigit()
         .padding(8)
     }
 
-    private func table(_ rows: [ProcessRow]) -> some View {
-        Table(rows, selection: $selection, sortOrder: $sortOrder) {
-            TableColumn("Name", value: \.name) { row in
-                HStack(spacing: 6) {
-                    if let icon = row.icon {
-                        Image(nsImage: icon)
-                            .resizable()
-                            .frame(width: 16, height: 16)
-                    } else {
-                        Image(systemName: "gearshape")
-                            .foregroundStyle(.secondary)
-                            .frame(width: 16, height: 16)
+    private func table(_ tree: Tree) -> some View {
+        Table(of: ProcessNode.self, selection: $selection, sortOrder: $sortOrder) {
+            TableColumn("Name", value: \.name) { node in
+                nameCell(node)
+            }
+            .width(min: 220, ideal: 340)
+
+            TableColumn("CPU", value: \.cpuSort) { node in
+                Text(value(node, node.cpu.map(Format.percent))).monospacedDigit()
+            }
+            .width(min: 60, ideal: 80)
+
+            TableColumn("Memory", value: \.memorySort) { node in
+                Text(value(node, node.memory.map(Format.bytes))).monospacedDigit()
+            }
+            .width(min: 70, ideal: 100)
+
+            TableColumn("Disk", value: \.diskSort) { node in
+                Text(value(node, node.diskRate.map(Format.rate))).monospacedDigit()
+            }
+            .width(min: 70, ideal: 100)
+        } rows: {
+            DisclosureTableRow(sectionNode("apps", "Apps", count: tree.apps.count), isExpanded: $showApps) {
+                ForEach(tree.apps) { app in
+                    DisclosureTableRow(app, isExpanded: expansion(for: app.id)) {
+                        ForEach(app.children) { child in
+                            TableRow(child)
+                        }
                     }
-                    Text(row.name).lineLimit(1)
                 }
             }
-            .width(min: 180, ideal: 280)
-
-            TableColumn("PID", value: \.pid) { row in
-                Text(String(row.pid)).monospacedDigit()
+            DisclosureTableRow(
+                sectionNode("background", "Background processes", count: tree.background.count),
+                isExpanded: $showBackground
+            ) {
+                ForEach(tree.background) { node in
+                    TableRow(node)
+                }
             }
-            .width(min: 50, ideal: 60)
-
-            TableColumn("User", value: \.user) { row in
-                Text(row.user).lineLimit(1)
+            DisclosureTableRow(
+                sectionNode("system", "macOS processes", count: tree.system.count),
+                isExpanded: $showSystem
+            ) {
+                ForEach(tree.system) { node in
+                    TableRow(node)
+                }
             }
-            .width(min: 60, ideal: 90)
-
-            TableColumn("CPU", value: \.cpu) { row in
-                Text(row.hasStats ? Format.percent(row.cpu) : "—").monospacedDigit()
-            }
-            .width(min: 60, ideal: 70)
-
-            TableColumn("Memory", value: \.memory) { row in
-                Text(row.hasStats ? Format.bytes(row.memory) : "—").monospacedDigit()
-            }
-            .width(min: 70, ideal: 90)
-
-            TableColumn("Disk", value: \.diskRate) { row in
-                Text(row.hasStats ? Format.rate(row.diskRate) : "—").monospacedDigit()
-            }
-            .width(min: 70, ideal: 90)
         }
-        .contextMenu(forSelectionType: ProcessRow.ID.self) { ids in
-            if let row = processRow(for: ids.first) {
-                if row.canEnd {
-                    Button("End Task") { pendingEnd = PendingEnd(row: row, mode: .graceful) }
-                    Button("Force Quit") { pendingEnd = PendingEnd(row: row, mode: .force) }
+        .contextMenu(forSelectionType: ProcessNode.ID.self) { ids in
+            if let id = ids.first, let node = tree.index[id], let target = node.target {
+                if target.canEnd {
+                    Button("End Task") { requestEnd(node, mode: .graceful) }
+                    Button("Force Quit") { requestEnd(node, mode: .force) }
                 }
-                if let path = row.path {
-                    if row.canEnd { Divider() }
+                if let path = target.path {
+                    if target.canEnd { Divider() }
                     Button("Show in Finder") {
                         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
                     }
@@ -136,23 +170,44 @@ struct ProcessesView: View {
         }
     }
 
-    private func footer(count: Int) -> some View {
-        let canEnd = processRow(for: selection)?.canEnd == true
-        return HStack {
-            Text("\(count) processes")
-                .foregroundStyle(.secondary)
-            if scope == .all {
-                Text("— means macOS hides that process's usage from non-admin apps.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+    @ViewBuilder
+    private func nameCell(_ node: ProcessNode) -> some View {
+        switch node.kind {
+        case .section:
+            Text(node.name).font(.headline)
+        case .app, .process:
+            HStack(spacing: 6) {
+                if let icon = node.icon {
+                    Image(nsImage: icon)
+                        .resizable()
+                        .frame(width: 16, height: 16)
+                } else {
+                    Image(systemName: "gearshape")
+                        .foregroundStyle(.secondary)
+                        .frame(width: 16, height: 16)
+                }
+                Text(node.name).lineLimit(1)
+                if node.kind == .app, node.children.count > 1 {
+                    Text("(\(node.children.count))").foregroundStyle(.secondary)
+                }
             }
+        }
+    }
+
+    private func footer(_ tree: Tree) -> some View {
+        let node = selection.flatMap { tree.index[$0] }
+        let canEnd = node?.target?.canEnd == true
+        return HStack {
+            Text("Usage of system processes comes from macOS's ps tool; their disk activity isn't available.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
             Spacer()
             Button("Force Quit") {
-                if let row = processRow(for: selection) { pendingEnd = PendingEnd(row: row, mode: .force) }
+                if let node { requestEnd(node, mode: .force) }
             }
             .disabled(!canEnd)
             Button("End Task") {
-                if let row = processRow(for: selection) { pendingEnd = PendingEnd(row: row, mode: .graceful) }
+                if let node { requestEnd(node, mode: .graceful) }
             }
             .disabled(!canEnd)
             .keyboardShortcut(.delete, modifiers: .command)
@@ -160,31 +215,145 @@ struct ProcessesView: View {
         .padding(8)
     }
 
-    private var visibleRows: [ProcessRow] {
+    // MARK: Building the tree
+
+    private func buildTree() -> Tree {
+        let all = store.processes
+        let byPID = Dictionary(all.map { ($0.pid, $0) }, uniquingKeysWith: { first, _ in first })
         let query = search.trimmingCharacters(in: .whitespaces)
-        return store.processes
-            .filter { row in
-                switch scope {
-                case .apps: return row.isApp
-                case .mine: return row.isMine
-                case .all: return true
+
+        func matches(_ row: ProcessRow) -> Bool {
+            guard !query.isEmpty else { return true }
+            if row.name.localizedCaseInsensitiveContains(query) || String(row.pid).hasPrefix(query) {
+                return true
+            }
+            // Keep an app's whole group when the app's name matches.
+            if let owner = row.ownerAppPID, let app = byPID[owner] {
+                return app.name.localizedCaseInsensitiveContains(query)
+            }
+            return false
+        }
+
+        var grouped: [pid_t: [ProcessRow]] = [:]
+        var background: [ProcessRow] = []
+        var system: [ProcessRow] = []
+        var count = 0
+        for row in all where matches(row) {
+            count += 1
+            if let owner = row.ownerAppPID {
+                grouped[owner, default: []].append(row)
+            } else if row.isMine {
+                background.append(row)
+            } else {
+                system.append(row)
+            }
+        }
+
+        var tree = Tree()
+        tree.processCount = count
+        tree.apps = grouped.map { entry -> ProcessNode in
+            let main = byPID[entry.key]
+            let children = entry.value.map { processNode($0) }.sorted(using: sortOrder)
+            return ProcessNode(
+                id: "app-\(entry.key)",
+                kind: .app,
+                name: main?.name ?? "PID \(entry.key)",
+                icon: main?.icon,
+                target: main,
+                cpu: total(children.map(\.cpu)),
+                memory: total(children.map(\.memory)),
+                diskRate: total(children.map(\.diskRate)),
+                children: children
+            )
+        }
+        .sorted(using: sortOrder)
+        tree.background = background.map { processNode($0) }.sorted(using: sortOrder)
+        tree.system = system.map { processNode($0) }.sorted(using: sortOrder)
+
+        for node in tree.apps + tree.background + tree.system {
+            tree.index[node.id] = node
+            for child in node.children {
+                tree.index[child.id] = child
+            }
+        }
+        return tree
+    }
+
+    private func processNode(_ row: ProcessRow) -> ProcessNode {
+        ProcessNode(
+            id: "pid-\(row.pid)",
+            kind: .process,
+            name: row.name,
+            icon: row.icon,
+            target: row,
+            cpu: row.cpu,
+            memory: row.memory,
+            diskRate: row.diskRate,
+            children: []
+        )
+    }
+
+    private func sectionNode(_ id: String, _ title: String, count: Int) -> ProcessNode {
+        ProcessNode(
+            id: "section-\(id)",
+            kind: .section,
+            name: "\(title) (\(count))",
+            icon: nil,
+            target: nil,
+            cpu: nil,
+            memory: nil,
+            diskRate: nil,
+            children: []
+        )
+    }
+
+    private func total<T: AdditiveArithmetic>(_ values: [T?]) -> T? {
+        let known = values.compactMap { $0 }
+        return known.isEmpty ? nil : known.reduce(T.zero, +)
+    }
+
+    // MARK: Helpers
+
+    /// Section headers show no numbers; unknown values show "—".
+    private func value(_ node: ProcessNode, _ text: String?) -> String {
+        node.kind == .section ? "" : (text ?? "—")
+    }
+
+    private func expansion(for id: String) -> Binding<Bool> {
+        Binding(
+            get: { expandedApps.contains(id) },
+            set: { isExpanded in
+                if isExpanded {
+                    expandedApps.insert(id)
+                } else {
+                    expandedApps.remove(id)
                 }
             }
-            .filter { row in
-                query.isEmpty
-                    || row.name.localizedCaseInsensitiveContains(query)
-                    || String(row.pid).hasPrefix(query)
-            }
-            .sorted(using: sortOrder)
+        )
+    }
+
+    private func requestEnd(_ node: ProcessNode, mode: ProcessStore.EndMode) {
+        guard let target = node.target, target.canEnd else { return }
+        pendingEnd = PendingEnd(
+            target: target,
+            name: node.name,
+            mode: mode,
+            processCount: node.kind == .app ? node.children.count : 1
+        )
     }
 
     private var dialogTitle: String {
         guard let pending = pendingEnd else { return "" }
-        return pending.mode == .force ? "Force quit \(pending.row.name)?" : "End \(pending.row.name)?"
+        return pending.mode == .force ? "Force quit \(pending.name)?" : "End \(pending.name)?"
     }
 
-    private func processRow(for id: ProcessRow.ID?) -> ProcessRow? {
-        guard let id else { return nil }
-        return store.processes.first { $0.pid == id }
+    private func dialogMessage(_ pending: PendingEnd) -> String {
+        var message = pending.mode == .force
+            ? "It is killed immediately. Unsaved work will be lost."
+            : "It will be asked to quit."
+        if pending.processCount > 1 {
+            message += " Its \(pending.processCount) processes will close with it."
+        }
+        return message
     }
 }

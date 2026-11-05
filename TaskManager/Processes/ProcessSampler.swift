@@ -20,18 +20,31 @@ enum ProcessSampler {
         let startTime: UInt64
     }
 
+    /// Usage reported by `/bin/ps`, for processes we can't read directly.
+    struct Fallback {
+        /// Percent of one core (can exceed 100), a short decaying average.
+        let cpuPercentOfOneCore: Double
+        /// Resident memory in bytes.
+        let residentBytes: UInt64
+    }
+
     struct RawProcess {
         let pid: pid_t
+        let parentPID: pid_t
         let uid: uid_t
         let command: String
         let path: String?
         let usage: Usage?
+        /// The process macOS holds responsible for this one (e.g. Safari for its web content processes).
+        let responsiblePID: pid_t?
+        let fallback: Fallback?
     }
 
     /// One pass over every process. `ticksToNanos` converts rusage CPU times,
     /// which are Mach ticks (not nanoseconds) on Apple silicon.
     static func snapshot(ticksToNanos: Double) -> [RawProcess] {
-        allPIDs().compactMap { (pid: pid_t) -> RawProcess? in
+        let fallbacks = psUsage() ?? [:]
+        return allPIDs().compactMap { (pid: pid_t) -> RawProcess? in
             guard let info = bsdInfo(pid) else { return nil }
             let usage = resourceUsage(pid).map { ri in
                 Usage(
@@ -41,8 +54,56 @@ enum ProcessSampler {
                     startTime: ri.ri_proc_start_abstime
                 )
             }
-            return RawProcess(pid: pid, uid: info.uid, command: info.command, path: path(pid), usage: usage)
+            return RawProcess(
+                pid: pid,
+                parentPID: info.parentPID,
+                uid: info.uid,
+                command: info.command,
+                path: path(pid),
+                usage: usage,
+                // Only needed for grouping our own processes under their app.
+                responsiblePID: usage == nil ? nil : responsiblePID(pid),
+                fallback: usage == nil ? fallbacks[pid] : nil
+            )
         }
+    }
+
+    /// `/bin/ps` is setuid root on macOS, so it can read CPU and memory for
+    /// system processes that a normal app can't. Returns nil if it can't.
+    static func psUsage() -> [pid_t: Fallback]? {
+        let result = Shell.run("/bin/ps", ["-axo", "pid=,%cpu=,rss="], environment: ["LC_ALL": "C"])
+        guard result.status == 0 else { return nil }
+
+        var usage: [pid_t: Fallback] = [:]
+        for line in result.output.split(separator: "\n") {
+            let columns = line.split(whereSeparator: { $0 == " " || $0 == "\t" })
+            guard columns.count >= 3,
+                  let pid = pid_t(columns[0]),
+                  let cpu = Double(columns[1]),
+                  let residentKB = UInt64(columns[2]) else { continue }
+            usage[pid] = Fallback(cpuPercentOfOneCore: cpu, residentBytes: residentKB * 1024)
+        }
+        // If ps couldn't read root processes either, launchd (PID 1) shows 0 memory:
+        // report "unknown" rather than misleading zeros.
+        guard let launchd = usage[1], launchd.residentBytes > 0 else { return nil }
+        return usage
+    }
+
+    private typealias ResponsibleForPID = @convention(c) (pid_t) -> pid_t
+
+    /// `responsibility_get_pid_responsible_for_pid` is a private libSystem function
+    /// (the same "responsible process" macOS uses for privacy prompts). Looked up at
+    /// runtime so the app still works, with less precise grouping, if it ever disappears.
+    private static let responsibleForPID: ResponsibleForPID? = {
+        let defaultHandle = UnsafeMutableRawPointer(bitPattern: -2) // RTLD_DEFAULT
+        guard let symbol = dlsym(defaultHandle, "responsibility_get_pid_responsible_for_pid") else { return nil }
+        return unsafeBitCast(symbol, to: ResponsibleForPID.self)
+    }()
+
+    static func responsiblePID(_ pid: pid_t) -> pid_t? {
+        guard let function = responsibleForPID else { return nil }
+        let responsible = function(pid)
+        return responsible > 0 ? responsible : nil
     }
 
     static func allPIDs() -> [pid_t] {
