@@ -20,7 +20,27 @@ A Windows-style Task Manager for macOS, written in SwiftUI.
 - Disable or enable your user's agents (uses `launchctl disable/enable`, takes effect at next login).
 - Shortcut to System Settings › Login Items.
 
-## Build and run
+## Install (no Xcode needed)
+
+1. Go to [Releases](https://github.com/seif-356/Task-manager-for-mac/releases), download the latest `TaskManager-*.zip`, and double-click it.
+2. Drag **TaskManager.app** into **Applications**.
+3. Open it. macOS blocks it with "Apple could not verify…" because the app isn't notarized (that costs $99/year). Click **Done**.
+4. Open **System Settings › Privacy & Security**, scroll down, click **Open Anyway** next to TaskManager, and confirm.
+
+You only need step 4 once. Requires macOS 14+, runs natively on Apple silicon and Intel.
+
+## Publishing a new version (maintainer)
+
+1. Test the app on your Mac.
+2. Merge your changes into `main`.
+3. Tag and push. GitHub builds the app, signs it ad-hoc, zips it and creates the release automatically:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+## Build from source
 
 Requirements: macOS 14 or later, Xcode 16 or later.
 
