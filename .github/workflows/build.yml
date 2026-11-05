@@ -8,7 +8,7 @@ jobs:
   build:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Xcode version
         run: xcodebuild -version
@@ -21,3 +21,13 @@ jobs:
             -configuration Release \
             CODE_SIGNING_ALLOWED=NO \
             build
+
+      - name: Verify the app binary contains the app's code
+        run: |
+          BIN=build/Release/TaskManager.app/Contents/MacOS/TaskManager
+          test -x "$BIN"
+          file "$BIN"
+          for symbol in ProcessStore SystemMonitor StartupStore; do
+            nm "$BIN" | grep -q "$symbol" || { echo "missing $symbol"; exit 1; }
+          done
+          echo "OK: all three modules compiled into the binary"
