@@ -19,24 +19,39 @@ enum SystemInfo {
     }
 
     /// Cumulative received/sent bytes per physical interface (en0, en1, ...).
-    /// Counters are 32-bit and wrap, so callers must subtract with `&-`.
-    static func networkCounters() -> [String: (rx: UInt32, tx: UInt32)] {
-        var result: [String: (rx: UInt32, tx: UInt32)] = [:]
-        var head: UnsafeMutablePointer<ifaddrs>?
-        guard getifaddrs(&head) == 0, let first = head else { return result }
-        defer { freeifaddrs(head) }
+    /// Uses the 64-bit counters from `sysctl(NET_RT_IFLIST2)`, so they never wrap;
+    /// a decrease means the interface was reset.
+    static func networkCounters() -> [String: (rx: UInt64, tx: UInt64)] {
+        let netRouteIfList2: Int32 = 6      // NET_RT_IFLIST2 (sys/socket.h)
+        let routeMessageIfInfo2: UInt8 = 0x12 // RTM_IFINFO2 (net/route.h)
 
-        for pointer in sequence(first: first, next: { $0.pointee.ifa_next }) {
-            let entry = pointer.pointee
-            guard let address = entry.ifa_addr,
-                  address.pointee.sa_family == UInt8(AF_LINK),
-                  let data = entry.ifa_data,
-                  entry.ifa_flags & UInt32(IFF_LOOPBACK) == 0 else { continue }
-            let name = String(cString: entry.ifa_name)
-            // Count only physical Ethernet/Wi-Fi so VPN tunnels aren't double-counted.
-            guard name.hasPrefix("en") else { continue }
-            let stats = data.assumingMemoryBound(to: if_data.self).pointee
-            result[name] = (stats.ifi_ibytes, stats.ifi_obytes)
+        var mib: [Int32] = [CTL_NET, AF_ROUTE, 0, 0, netRouteIfList2, 0]
+        var length = 0
+        guard sysctl(&mib, UInt32(mib.count), nil, &length, nil, 0) == 0, length > 0 else { return [:] }
+        var buffer = [UInt8](repeating: 0, count: length)
+        guard sysctl(&mib, UInt32(mib.count), &buffer, &length, nil, 0) == 0 else { return [:] }
+
+        var result: [String: (rx: UInt64, tx: UInt64)] = [:]
+        buffer.withUnsafeBytes { raw in
+            var offset = 0
+            while offset + MemoryLayout<if_msghdr>.size <= length {
+                let header = raw.loadUnaligned(fromByteOffset: offset, as: if_msghdr.self)
+                let messageLength = Int(header.ifm_msglen)
+                guard messageLength > 0 else { break }
+                defer { offset += messageLength }
+
+                guard header.ifm_type == routeMessageIfInfo2,
+                      offset + MemoryLayout<if_msghdr2>.size <= length else { continue }
+                let message = raw.loadUnaligned(fromByteOffset: offset, as: if_msghdr2.self)
+                guard message.ifm_flags & IFF_LOOPBACK == 0 else { continue }
+
+                var nameBuffer = [CChar](repeating: 0, count: Int(IF_NAMESIZE) + 1)
+                guard if_indextoname(UInt32(message.ifm_index), &nameBuffer) != nil else { continue }
+                let name = String(decoding: nameBuffer.prefix(while: { $0 != 0 }).map { UInt8(bitPattern: $0) }, as: UTF8.self)
+                // Count only physical Ethernet/Wi-Fi so VPN tunnels aren't double-counted.
+                guard name.hasPrefix("en") else { continue }
+                result[name] = (message.ifm_data.ifi_ibytes, message.ifm_data.ifi_obytes)
+            }
         }
         return result
     }
@@ -72,7 +87,7 @@ final class SystemMonitor {
     private let host = mach_host_self()
     @ObservationIgnored private var pageSize: UInt64 = 16_384
     @ObservationIgnored private var previousTicks: CPUTicks?
-    @ObservationIgnored private var previousNet: [String: (rx: UInt32, tx: UInt32)] = [:]
+    @ObservationIgnored private var previousNet: [String: (rx: UInt64, tx: UInt64)] = [:]
     @ObservationIgnored private var previousNetTime: UInt64 = 0
     @ObservationIgnored private var task: Task<Void, Never>?
 
@@ -145,8 +160,9 @@ final class SystemMonitor {
         var sent: UInt64 = 0
         for (name, value) in current {
             guard let prev = previousNet[name] else { continue }
-            received += UInt64(value.rx &- prev.rx)
-            sent += UInt64(value.tx &- prev.tx)
+            // 64-bit counters don't wrap; a decrease means the interface was reset.
+            received += value.rx >= prev.rx ? value.rx - prev.rx : 0
+            sent += value.tx >= prev.tx ? value.tx - prev.tx : 0
         }
 
         let rx = Double(received) / seconds
@@ -168,8 +184,9 @@ final class SystemMonitor {
             }
         }
         guard result == KERN_SUCCESS else { return nil }
-        let ticks = load.cpu_ticks // (user, system, idle, nice)
-        return (UInt32(ticks.0), UInt32(ticks.1), UInt32(ticks.2), UInt32(ticks.3))
+        // cpu_ticks is natural_t (UInt32): (user, system, idle, nice). Wraps are handled with &-.
+        let ticks = load.cpu_ticks
+        return (ticks.0, ticks.1, ticks.2, ticks.3)
     }
 
     private func readVMStats() -> vm_statistics64? {

@@ -9,12 +9,21 @@ struct StartupItem: Identifiable {
         case systemDaemon = "System daemon"
     }
 
+    enum KeepAlive {
+        case no
+        case always
+        /// A dictionary of conditions (network up, path exists, ...): runs only when they hold.
+        case conditional
+    }
+
     let plistPath: String
     let label: String
     let program: String?
     let kind: Kind
+    /// False when the plist couldn't be read or parsed; such rows can't be toggled.
+    let isReadable: Bool
     let runAtLoad: Bool
-    let keepAlive: Bool
+    let keepAlive: KeepAlive
     let disabledInPlist: Bool
     /// launchd's own enable/disable override, which wins over the plist's `Disabled` key.
     let overrideDisabled: Bool?
@@ -24,14 +33,20 @@ struct StartupItem: Identifiable {
     var id: String { plistPath }
     var isEnabled: Bool { !(overrideDisabled ?? disabledInPlist) }
     /// Daemons live in the system domain and need admin rights to change.
-    var canToggle: Bool { kind != .systemDaemon }
+    var canToggle: Bool { isReadable && kind != .systemDaemon }
 
-    var statusText: String { isEnabled ? "Enabled" : "Disabled" }
+    var statusText: String {
+        guard isReadable else { return "Unreadable" }
+        return isEnabled ? "Enabled" : "Disabled"
+    }
     var programText: String { program ?? "—" }
 
     var startsText: String {
-        guard runAtLoad || keepAlive else { return "On demand" }
-        return kind == .systemDaemon ? "At boot" : "At login"
+        guard isReadable else { return "—" }
+        if runAtLoad || keepAlive == .always {
+            return kind == .systemDaemon ? "At boot" : "At login"
+        }
+        return keepAlive == .conditional ? "On condition" : "On demand"
     }
 
     var runningText: String {
@@ -42,7 +57,13 @@ struct StartupItem: Identifiable {
 
 /// Reads launchd job definitions from the standard folders (not /System, which is Apple's).
 enum StartupScanner {
-    static func scan() -> [StartupItem] {
+    struct Result {
+        let items: [StartupItem]
+        /// Problems that make the list incomplete or its status unreliable.
+        let warnings: [String]
+    }
+
+    static func scan() -> Result {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         let sources: [(directory: String, kind: StartupItem.Kind)] = [
             ("\(home)/Library/LaunchAgents", .userAgent),
@@ -50,19 +71,48 @@ enum StartupScanner {
             ("/Library/LaunchDaemons", .systemDaemon),
         ]
 
+        var warnings: [String] = []
         let userOverrides = disabledOverrides(domain: "gui/\(getuid())")
         let systemOverrides = disabledOverrides(domain: "system")
         let running = runningJobs()
+        if userOverrides == nil {
+            warnings.append("Couldn't read which agents are disabled, so their Status may be wrong.")
+        }
+        if systemOverrides == nil {
+            warnings.append("Couldn't read which daemons are disabled, so their Status may be wrong.")
+        }
+        if running == nil {
+            warnings.append("Couldn't read which agents are running.")
+        }
 
         var items: [StartupItem] = []
+        var unreadable = 0
         for source in sources {
-            guard let files = try? FileManager.default.contentsOfDirectory(atPath: source.directory) else { continue }
+            let files: [String]
+            do {
+                files = try FileManager.default.contentsOfDirectory(atPath: source.directory)
+            } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+                continue // Folder doesn't exist on this Mac: nothing to list.
+            } catch {
+                warnings.append("Couldn't read \(source.directory): \(error.localizedDescription)")
+                continue
+            }
+
             for file in files where file.hasSuffix(".plist") {
                 let path = (source.directory as NSString).appendingPathComponent(file)
-                let plist = readPlist(path) ?? [:]
-                let label = plist["Label"] as? String ?? (file as NSString).deletingPathExtension
-                let program = plist["Program"] as? String ?? (plist["ProgramArguments"] as? [String])?.first
-                let keepAlive = (plist["KeepAlive"] as? Bool) ?? (plist["KeepAlive"] is [String: Any])
+                let plist = readPlist(path)
+                if plist == nil { unreadable += 1 }
+                let values = plist ?? [:]
+                let label = values["Label"] as? String ?? (file as NSString).deletingPathExtension
+                let program = values["Program"] as? String ?? (values["ProgramArguments"] as? [String])?.first
+                let keepAlive: StartupItem.KeepAlive
+                if let flag = values["KeepAlive"] as? Bool {
+                    keepAlive = flag ? .always : .no
+                } else if values["KeepAlive"] is [String: Any] {
+                    keepAlive = .conditional
+                } else {
+                    keepAlive = .no
+                }
                 let isDaemon = source.kind == .systemDaemon
 
                 items.append(StartupItem(
@@ -70,15 +120,19 @@ enum StartupScanner {
                     label: label,
                     program: program,
                     kind: source.kind,
-                    runAtLoad: plist["RunAtLoad"] as? Bool ?? false,
+                    isReadable: plist != nil,
+                    runAtLoad: values["RunAtLoad"] as? Bool ?? false,
                     keepAlive: keepAlive,
-                    disabledInPlist: plist["Disabled"] as? Bool ?? false,
-                    overrideDisabled: isDaemon ? systemOverrides[label] : userOverrides[label],
-                    pid: isDaemon ? nil : running[label]
+                    disabledInPlist: values["Disabled"] as? Bool ?? false,
+                    overrideDisabled: isDaemon ? systemOverrides?[label] : userOverrides?[label],
+                    pid: isDaemon ? nil : running?[label]
                 ))
             }
         }
-        return items
+        if unreadable > 0 {
+            warnings.append("\(unreadable) startup file(s) couldn't be read and are marked Unreadable.")
+        }
+        return Result(items: items, warnings: warnings)
     }
 
     /// Persistently enables/disables an agent for the current user. Takes effect at next login.
@@ -97,9 +151,10 @@ enum StartupScanner {
     }
 
     /// Parses `launchctl print-disabled <domain>` lines like `"com.example.agent" => disabled`.
-    private static func disabledOverrides(domain: String) -> [String: Bool] {
+    /// Nil if launchctl failed (as opposed to an empty list).
+    private static func disabledOverrides(domain: String) -> [String: Bool]? {
         let result = Shell.run("/bin/launchctl", ["print-disabled", domain])
-        guard result.status == 0 else { return [:] }
+        guard result.status == 0 else { return nil }
 
         var overrides: [String: Bool] = [:]
         for line in result.output.split(separator: "\n") {
@@ -116,9 +171,10 @@ enum StartupScanner {
     }
 
     /// Parses `launchctl list` (PID, status, label) for the current user's session.
-    private static func runningJobs() -> [String: Int] {
+    /// Nil if launchctl failed (as opposed to nothing running).
+    private static func runningJobs() -> [String: Int]? {
         let result = Shell.run("/bin/launchctl", ["list"])
-        guard result.status == 0 else { return [:] }
+        guard result.status == 0 else { return nil }
 
         var jobs: [String: Int] = [:]
         for line in result.output.split(separator: "\n").dropFirst() {
@@ -134,17 +190,29 @@ enum StartupScanner {
 @Observable
 final class StartupStore {
     private(set) var items: [StartupItem] = []
+    private(set) var warnings: [String] = []
     private(set) var isLoading = false
     var errorMessage: String?
 
+    /// Set when a reload is requested while a scan is already running,
+    /// so the in-flight (possibly stale) scan is followed by a fresh one.
+    @ObservationIgnored private var reloadRequested = false
+
     func reload() {
-        guard !isLoading else { return }
+        guard !isLoading else {
+            reloadRequested = true
+            return
+        }
         isLoading = true
         Task {
-            let scanned = await Task.detached(priority: .userInitiated) {
-                StartupScanner.scan()
-            }.value
-            self.items = scanned
+            repeat {
+                self.reloadRequested = false
+                let result = await Task.detached(priority: .userInitiated) {
+                    StartupScanner.scan()
+                }.value
+                self.items = result.items
+                self.warnings = result.warnings
+            } while self.reloadRequested
             self.isLoading = false
         }
     }

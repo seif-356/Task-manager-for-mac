@@ -1,13 +1,48 @@
 import Darwin
 import Foundation
 
-/// Thin wrappers around libproc. None of these need root, but `usage(_:)`
+/// Thin wrappers around libproc. None of these need root, but `resourceUsage(_:)`
 /// only succeeds for processes owned by the current user.
+/// Everything here is safe to call off the main thread.
 enum ProcessSampler {
     struct BSDInfo {
         let parentPID: pid_t
         let uid: uid_t
         let command: String
+    }
+
+    struct Usage {
+        /// Total CPU time in nanoseconds.
+        let cpuNanos: Double
+        let diskBytes: UInt64
+        let memory: UInt64
+        /// Mach start time. PID + start time identifies one exact process.
+        let startTime: UInt64
+    }
+
+    struct RawProcess {
+        let pid: pid_t
+        let uid: uid_t
+        let command: String
+        let path: String?
+        let usage: Usage?
+    }
+
+    /// One pass over every process. `ticksToNanos` converts rusage CPU times,
+    /// which are Mach ticks (not nanoseconds) on Apple silicon.
+    static func snapshot(ticksToNanos: Double) -> [RawProcess] {
+        allPIDs().compactMap { (pid: pid_t) -> RawProcess? in
+            guard let info = bsdInfo(pid) else { return nil }
+            let usage = resourceUsage(pid).map { ri in
+                Usage(
+                    cpuNanos: Double(ri.ri_user_time &+ ri.ri_system_time) * ticksToNanos,
+                    diskBytes: ri.ri_diskio_bytesread &+ ri.ri_diskio_byteswritten,
+                    memory: ri.ri_phys_footprint,
+                    startTime: ri.ri_proc_start_abstime
+                )
+            }
+            return RawProcess(pid: pid, uid: info.uid, command: info.command, path: path(pid), usage: usage)
+        }
     }
 
     static func allPIDs() -> [pid_t] {
@@ -41,8 +76,8 @@ enum ProcessSampler {
         return String(decoding: buffer.prefix(Int(length)), as: UTF8.self)
     }
 
-    /// CPU time, memory footprint and disk I/O. Fails (nil) for other users' processes.
-    static func usage(_ pid: pid_t) -> rusage_info_v4? {
+    /// CPU time, memory footprint, disk I/O and start time. Nil for other users' processes.
+    static func resourceUsage(_ pid: pid_t) -> rusage_info_v4? {
         var info = rusage_info_v4()
         let result = withUnsafeMutablePointer(to: &info) { pointer in
             pointer.withMemoryRebound(to: rusage_info_t?.self, capacity: 1) { rebound in

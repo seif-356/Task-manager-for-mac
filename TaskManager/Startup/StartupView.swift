@@ -100,6 +100,11 @@ struct StartupView: View {
                 Text("Apps added in System Settings › Login Items can't be read by other apps.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                ForEach(store.warnings, id: \.self) { warning in
+                    Label(warning, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
             }
             Button("Open Login Items…") {
                 if let url = URL(string: "x-apple.systempreferences:com.apple.LoginItems-Settings.extension") {
@@ -120,9 +125,16 @@ struct StartupView: View {
                 }
             }
             .disabled(selected?.canToggle != true)
-            .help(selected?.kind == .systemDaemon ? "System daemons need administrator rights (not supported yet)." : "")
+            .help(toggleHelp(for: selected))
         }
         .padding(8)
+    }
+
+    private func toggleHelp(for item: StartupItem?) -> String {
+        guard let item else { return "" }
+        if !item.isReadable { return "This startup file couldn't be read." }
+        if item.kind == .systemDaemon { return "System daemons need administrator rights (not supported yet)." }
+        return ""
     }
 
     private func startupItem(for id: StartupItem.ID?) -> StartupItem? {

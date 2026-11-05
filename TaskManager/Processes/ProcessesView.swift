@@ -39,7 +39,7 @@ struct ProcessesView: View {
         ) { pending in
             Button(pending.mode == .force ? "Force Quit" : "End Task", role: .destructive) {
                 errorMessage = store.end(pending.row, mode: pending.mode)
-                store.refresh()
+                Task { await store.refresh() }
             }
             Button("Cancel", role: .cancel) {}
         } message: { pending in
@@ -122,10 +122,12 @@ struct ProcessesView: View {
         }
         .contextMenu(forSelectionType: ProcessRow.ID.self) { ids in
             if let row = processRow(for: ids.first) {
-                Button("End Task") { pendingEnd = PendingEnd(row: row, mode: .graceful) }
-                Button("Force Quit") { pendingEnd = PendingEnd(row: row, mode: .force) }
+                if row.canEnd {
+                    Button("End Task") { pendingEnd = PendingEnd(row: row, mode: .graceful) }
+                    Button("Force Quit") { pendingEnd = PendingEnd(row: row, mode: .force) }
+                }
                 if let path = row.path {
-                    Divider()
+                    if row.canEnd { Divider() }
                     Button("Show in Finder") {
                         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
                     }
@@ -135,7 +137,8 @@ struct ProcessesView: View {
     }
 
     private func footer(count: Int) -> some View {
-        HStack {
+        let canEnd = processRow(for: selection)?.canEnd == true
+        return HStack {
             Text("\(count) processes")
                 .foregroundStyle(.secondary)
             if scope == .all {
@@ -147,11 +150,11 @@ struct ProcessesView: View {
             Button("Force Quit") {
                 if let row = processRow(for: selection) { pendingEnd = PendingEnd(row: row, mode: .force) }
             }
-            .disabled(selection == nil)
+            .disabled(!canEnd)
             Button("End Task") {
                 if let row = processRow(for: selection) { pendingEnd = PendingEnd(row: row, mode: .graceful) }
             }
-            .disabled(selection == nil)
+            .disabled(!canEnd)
             .keyboardShortcut(.delete, modifiers: .command)
         }
         .padding(8)
