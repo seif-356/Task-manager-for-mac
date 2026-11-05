@@ -1,0 +1,114 @@
+name: Build & Release
+
+# Every push: build, ad-hoc sign, verify, and zip the app.
+# Pushing a tag like v0.1.0 also publishes the zip as a GitHub Release.
+#
+# Values derived from the tag name are only ever passed to scripts through
+# environment variables, never interpolated into script source.
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  BUILD_DIR: ${{ github.workspace }}/build
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Xcode version
+        run: xcodebuild -version
+
+      - name: Work out version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="0.0.0-dev"
+          fi
+          # Allow only plain version characters (e.g. 1.2.3, 1.2.3-beta.1).
+          if [[ ! "$VERSION" =~ ^[0-9A-Za-z.-]+$ ]]; then
+            echo "Refusing unsafe version string: $VERSION"
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "ZIP=TaskManager-$VERSION.zip" >> "$GITHUB_ENV"
+          echo "APP=$BUILD_DIR/Release/TaskManager.app" >> "$GITHUB_ENV"
+
+      - name: Build (universal, ad-hoc signed)
+        env:
+          BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          xcodebuild \
+            -project TaskManager.xcodeproj \
+            -target TaskManager \
+            -configuration Release \
+            SYMROOT="$BUILD_DIR" \
+            MARKETING_VERSION="$VERSION" \
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY=- \
+            DEVELOPMENT_TEAM= \
+            build
+
+      - name: Verify app
+        run: |
+          BIN="$APP/Contents/MacOS/TaskManager"
+          test -x "$BIN"
+
+          ARCHS="$(lipo -archs "$BIN")"
+          echo "Architectures: $ARCHS"
+          [[ "$ARCHS" == *arm64* && "$ARCHS" == *x86_64* ]]
+
+          nm "$BIN" > "$RUNNER_TEMP/symbols.txt"
+          for symbol in ProcessStore SystemMonitor StartupStore; do
+            grep -q "$symbol" "$RUNNER_TEMP/symbols.txt" || { echo "missing $symbol"; exit 1; }
+          done
+
+          test -f "$APP/Contents/Resources/AppIcon.icns" || test -f "$APP/Contents/Resources/Assets.car"
+          /usr/libexec/PlistBuddy -c "Print CFBundleIconName" "$APP/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" "$APP/Contents/Info.plist"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          codesign -dv "$APP" > "$RUNNER_TEMP/codesign.txt" 2>&1
+          cat "$RUNNER_TEMP/codesign.txt"
+          grep -q "Signature=adhoc" "$RUNNER_TEMP/codesign.txt"
+
+      - name: Zip
+        run: |
+          ditto -c -k --keepParent "$APP" "$ZIP"
+          ls -lh "$ZIP"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: TaskManager-${{ env.VERSION }}
+          path: ${{ env.ZIP }}
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > "$RUNNER_TEMP/notes.md" <<'NOTES'
+          ## Install
+
+          1. Download `TaskManager-*.zip` below and double-click it.
+          2. Drag **TaskManager.app** into your **Applications** folder.
+          3. Open it. macOS will block it with "Apple could not verify…" because this build isn't notarized by Apple. Click **Done**.
+          4. Open **System Settings › Privacy & Security**, scroll down, and click **Open Anyway** next to TaskManager. Confirm with your password.
+
+          You only need to do step 4 once.
+
+          Requires macOS 14 or later. Runs natively on Apple silicon and Intel.
+          NOTES
+          gh release create "$GITHUB_REF_NAME" "$ZIP" \
+            --title "Task Manager $VERSION" \
+            --notes-file "$RUNNER_TEMP/notes.md"
