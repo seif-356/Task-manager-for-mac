@@ -20,10 +20,8 @@ struct ProcessNode: Identifiable {
     let memory: UInt64?
     let diskRate: Double?
     let children: [ProcessNode]
-
-    var cpuSort: Double { cpu ?? -1 }
-    var memorySort: UInt64 { memory ?? 0 }
-    var diskSort: Double { diskRate ?? -1 }
+    /// For apps: all of the app's processes, even when a search hides some.
+    let processCount: Int
 }
 
 /// Windows-style Processes tab: Apps (expandable, usage summed over all of an
@@ -49,7 +47,7 @@ struct ProcessesView: View {
 
     @State private var search = ""
     @State private var selection: ProcessNode.ID?
-    @State private var sortOrder = [KeyPathComparator(\ProcessNode.cpuSort, order: .reverse)]
+    @State private var sortOrder = [KeyPathComparator(\ProcessNode.cpu, comparator: NilsLastComparator<Double>(order: .reverse))]
     @State private var showApps = true
     @State private var showBackground = true
     @State private var showSystem = false
@@ -113,17 +111,17 @@ struct ProcessesView: View {
             }
             .width(min: 220, ideal: 340)
 
-            TableColumn("CPU", value: \.cpuSort) { node in
+            TableColumn("CPU", value: \.cpu, comparator: NilsLastComparator<Double>()) { node in
                 Text(value(node, node.cpu.map(Format.percent))).monospacedDigit()
             }
             .width(min: 60, ideal: 80)
 
-            TableColumn("Memory", value: \.memorySort) { node in
+            TableColumn("Memory", value: \.memory, comparator: NilsLastComparator<UInt64>()) { node in
                 Text(value(node, node.memory.map(Format.bytes))).monospacedDigit()
             }
             .width(min: 70, ideal: 100)
 
-            TableColumn("Disk", value: \.diskSort) { node in
+            TableColumn("Disk", value: \.diskRate, comparator: NilsLastComparator<Double>()) { node in
                 Text(value(node, node.diskRate.map(Format.rate))).monospacedDigit()
             }
             .width(min: 70, ideal: 100)
@@ -187,8 +185,8 @@ struct ProcessesView: View {
                         .frame(width: 16, height: 16)
                 }
                 Text(node.name).lineLimit(1)
-                if node.kind == .app, node.children.count > 1 {
-                    Text("(\(node.children.count))").foregroundStyle(.secondary)
+                if node.kind == .app, node.processCount > 1 {
+                    Text("(\(node.processCount))").foregroundStyle(.secondary)
                 }
             }
         }
@@ -223,52 +221,53 @@ struct ProcessesView: View {
         let query = search.trimmingCharacters(in: .whitespaces)
 
         func matches(_ row: ProcessRow) -> Bool {
-            guard !query.isEmpty else { return true }
-            if row.name.localizedCaseInsensitiveContains(query) || String(row.pid).hasPrefix(query) {
-                return true
-            }
-            // Keep an app's whole group when the app's name matches.
-            if let owner = row.ownerAppPID, let app = byPID[owner] {
-                return app.name.localizedCaseInsensitiveContains(query)
-            }
-            return false
+            query.isEmpty
+                || row.name.localizedCaseInsensitiveContains(query)
+                || String(row.pid).hasPrefix(query)
         }
 
+        // Group everything first, so app totals and counts always cover the
+        // whole app; the search only decides which rows are shown.
         var grouped: [pid_t: [ProcessRow]] = [:]
         var background: [ProcessRow] = []
         var system: [ProcessRow] = []
-        var count = 0
-        for row in all where matches(row) {
-            count += 1
+        for row in all {
             if let owner = row.ownerAppPID {
                 grouped[owner, default: []].append(row)
-            } else if row.isMine {
-                background.append(row)
-            } else {
-                system.append(row)
+            } else if matches(row) {
+                if row.isMine {
+                    background.append(row)
+                } else {
+                    system.append(row)
+                }
             }
         }
 
         var tree = Tree()
-        tree.processCount = count
-        tree.apps = grouped.map { entry -> ProcessNode in
+        tree.apps = grouped.compactMap { entry -> ProcessNode? in
             let main = byPID[entry.key]
-            let children = entry.value.map { processNode($0) }.sorted(using: sortOrder)
+            let appMatches = main.map { matches($0) } ?? false
+            let members = entry.value
+            let shown = appMatches ? members : members.filter { matches($0) }
+            guard !shown.isEmpty else { return nil }
+            let mainStart = main?.startTime ?? 0
             return ProcessNode(
-                id: "app-\(entry.key)",
+                id: "app-\(entry.key)-\(mainStart)",
                 kind: .app,
                 name: main?.name ?? "PID \(entry.key)",
                 icon: main?.icon,
                 target: main,
-                cpu: total(children.map(\.cpu)),
-                memory: total(children.map(\.memory)),
-                diskRate: total(children.map(\.diskRate)),
-                children: children
+                cpu: total(members.map(\.cpu)),
+                memory: total(members.map(\.memory)),
+                diskRate: total(members.map(\.diskRate)),
+                children: shown.map { processNode($0) }.sorted(using: sortOrder),
+                processCount: members.count
             )
         }
         .sorted(using: sortOrder)
         tree.background = background.map { processNode($0) }.sorted(using: sortOrder)
         tree.system = system.map { processNode($0) }.sorted(using: sortOrder)
+        tree.processCount = tree.apps.reduce(0) { $0 + $1.children.count } + tree.background.count + tree.system.count
 
         for node in tree.apps + tree.background + tree.system {
             tree.index[node.id] = node
@@ -281,7 +280,7 @@ struct ProcessesView: View {
 
     private func processNode(_ row: ProcessRow) -> ProcessNode {
         ProcessNode(
-            id: "pid-\(row.pid)",
+            id: "pid-\(row.id)",
             kind: .process,
             name: row.name,
             icon: row.icon,
@@ -289,7 +288,8 @@ struct ProcessesView: View {
             cpu: row.cpu,
             memory: row.memory,
             diskRate: row.diskRate,
-            children: []
+            children: [],
+            processCount: 1
         )
     }
 
@@ -303,7 +303,8 @@ struct ProcessesView: View {
             cpu: nil,
             memory: nil,
             diskRate: nil,
-            children: []
+            children: [],
+            processCount: count
         )
     }
 
@@ -338,7 +339,7 @@ struct ProcessesView: View {
             target: target,
             name: node.name,
             mode: mode,
-            processCount: node.kind == .app ? node.children.count : 1
+            processCount: node.processCount
         )
     }
 
@@ -352,7 +353,7 @@ struct ProcessesView: View {
             ? "It is killed immediately. Unsaved work will be lost."
             : "It will be asked to quit."
         if pending.processCount > 1 {
-            message += " Its \(pending.processCount) processes will close with it."
+            message += " It has \(pending.processCount) processes; its helpers normally close with it."
         }
         return message
     }

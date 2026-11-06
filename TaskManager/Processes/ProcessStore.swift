@@ -21,16 +21,14 @@ struct ProcessRow: Identifiable {
     /// Mach start time, when readable. Used to make sure a PID wasn't reused.
     let startTime: UInt64?
 
-    var id: pid_t { pid }
+    /// PID plus start time, so a reused PID is a different row (and selection).
+    var id: String { "\(pid)-\(startTime ?? 0)" }
 
-    /// PID 0 is kernel_task, and kill(0, …) would signal our own process group.
-    var canEnd: Bool { pid > 0 }
+    /// Only processes whose identity we can re-check before signalling them.
+    /// That excludes PID 0 (kill(0, …) would signal our own process group) and
+    /// other users' processes, which a normal app can't end anyway.
+    var canEnd: Bool { pid > 0 && startTime != nil }
     var isAppMain: Bool { ownerAppPID == pid }
-
-    // Non-optional keys so columns can sort; unknown values sort last.
-    var cpuSort: Double { cpu ?? -1 }
-    var memorySort: UInt64 { memory ?? 0 }
-    var diskSort: Double { diskRate ?? -1 }
 }
 
 @MainActor
@@ -159,7 +157,7 @@ final class ProcessStore {
                 path: process.path,
                 isMine: process.uid == myUID,
                 icon: app?.icon,
-                ownerAppPID: process.uid == myUID ? owner(of: process) : nil,
+                ownerAppPID: owner(of: process),
                 cpu: cpu.map { min($0, 100) },
                 memory: memory,
                 diskRate: diskRate,
@@ -174,11 +172,11 @@ final class ProcessStore {
 
     /// Returns an error message, or nil on success.
     func end(_ row: ProcessRow, mode: EndMode) -> String? {
-        guard row.canEnd else {
-            return "\(row.name) is part of macOS and can't be ended."
+        guard row.canEnd, let expected = row.startTime else {
+            return "\(row.name) belongs to macOS or another user and can't be ended from here."
         }
         // PIDs get reused: make sure this is still the process the user picked.
-        if let expected = row.startTime, ProcessSampler.resourceUsage(row.pid)?.ri_proc_start_abstime != expected {
+        guard ProcessSampler.resourceUsage(row.pid)?.ri_proc_start_abstime == expected else {
             return "\(row.name) has already exited."
         }
 

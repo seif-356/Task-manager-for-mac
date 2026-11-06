@@ -20,7 +20,7 @@ struct DetailsView: View {
     @State private var scope: Scope = .all
     @State private var search = ""
     @State private var selection: ProcessRow.ID?
-    @State private var sortOrder = [KeyPathComparator(\ProcessRow.cpuSort, order: .reverse)]
+    @State private var sortOrder = [KeyPathComparator(\ProcessRow.cpu, comparator: NilsLastComparator<Double>(order: .reverse))]
     @State private var pendingEnd: PendingEnd?
     @State private var errorMessage: String?
 
@@ -106,17 +106,17 @@ struct DetailsView: View {
             }
             .width(min: 60, ideal: 90)
 
-            TableColumn("CPU", value: \.cpuSort) { row in
+            TableColumn("CPU", value: \.cpu, comparator: NilsLastComparator<Double>()) { row in
                 Text(row.cpu.map(Format.percent) ?? "—").monospacedDigit()
             }
             .width(min: 60, ideal: 70)
 
-            TableColumn("Memory", value: \.memorySort) { row in
+            TableColumn("Memory", value: \.memory, comparator: NilsLastComparator<UInt64>()) { row in
                 Text(row.memory.map(Format.bytes) ?? "—").monospacedDigit()
             }
             .width(min: 70, ideal: 90)
 
-            TableColumn("Disk", value: \.diskSort) { row in
+            TableColumn("Disk", value: \.diskRate, comparator: NilsLastComparator<Double>()) { row in
                 Text(row.diskRate.map(Format.rate) ?? "—").monospacedDigit()
             }
             .width(min: 70, ideal: 90)
@@ -186,6 +186,6 @@ struct DetailsView: View {
 
     private func processRow(for id: ProcessRow.ID?) -> ProcessRow? {
         guard let id else { return nil }
-        return store.processes.first { $0.pid == id }
+        return store.processes.first { $0.id == id }
     }
 }
