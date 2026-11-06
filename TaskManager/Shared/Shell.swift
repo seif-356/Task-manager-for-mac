@@ -8,10 +8,13 @@ enum Shell {
         let error: String
     }
 
-    static func run(_ executable: String, _ arguments: [String]) -> Result {
+    static func run(_ executable: String, _ arguments: [String], environment: [String: String]? = nil) -> Result {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
+        if let environment {
+            process.environment = environment
+        }
 
         let stdout = Pipe()
         let stderr = Pipe()

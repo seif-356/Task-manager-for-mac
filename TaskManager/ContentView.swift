@@ -7,12 +7,14 @@ struct ContentView: View {
 
     var body: some View {
         TabView {
-            ProcessesView(store: processes)
+            ProcessesView(store: processes, monitor: system)
                 .tabItem { Label("Processes", systemImage: "list.bullet.rectangle") }
             PerformanceView(monitor: system)
                 .tabItem { Label("Performance", systemImage: "waveform.path.ecg") }
             StartupView(store: startup)
                 .tabItem { Label("Startup Items", systemImage: "power") }
+            DetailsView(store: processes)
+                .tabItem { Label("Details", systemImage: "tablecells") }
         }
         .padding(.top, 8)
         .onAppear {
